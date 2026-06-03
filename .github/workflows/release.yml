@@ -1,0 +1,49 @@
+name: Release
+
+# Triggered by pushing a tag like v0.1.0, v0.2.0, etc. The tag's version
+# (minus the leading "v") must match CFBundleShortVersionString in Info.plist
+# so the produced filename — dist/QlabCueViewer-<version>.zip — exists.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # needed for `gh release create` to attach the zip
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Build universal .app and zip
+        run: make zip
+
+      - name: Show what we built
+        run: |
+          ls -lh dist/
+          file QlabCueViewer.app/Contents/MacOS/QlabCueViewer
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ZIP="dist/QlabCueViewer-${VERSION}.zip"
+          test -f "$ZIP" || { echo "Missing $ZIP — does Info.plist version match the tag?"; exit 1; }
+
+          gh release create "$GITHUB_REF_NAME" "$ZIP" \
+            --title "QLab Cue Viewer ${VERSION}" \
+            --notes "## Install
+
+1. Unzip and drag **QlabCueViewer.app** to **/Applications**.
+2. First launch: right-click the app → **Open** → confirm in the Gatekeeper dialog. (The build is ad-hoc signed, not Apple-notarized; this only matters the first launch.)
+3. Click the menu bar icon → **Preferences…** to set your QLab host/port and relay channel.
+
+Universal binary — runs on Apple Silicon and Intel Macs (macOS 14+).
+
+Built from commit ${GITHUB_SHA:0:7}."

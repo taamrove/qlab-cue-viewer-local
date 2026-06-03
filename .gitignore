@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+.swiftpm/
+*.xcodeproj/
+DerivedData/
+*.log
+.env
+discovery-output/
+QlabCueViewer.app/
+dist/
