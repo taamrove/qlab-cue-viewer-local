@@ -15,6 +15,12 @@ actor RelayPublisher {
     private var reconnectDelay: TimeInterval = 1
     private var isRunning = false
     private var connected = false
+    // Latest payload buffered while disconnected. Replayed the instant we
+    // (re)connect. Solves the start-up race where the first QLab snapshot
+    // fires before the WebSocket handshake finishes — without this, the
+    // dedup in Bridge skips every subsequent identical snapshot and the
+    // viewer never sees anything until QLab state actually changes.
+    private var pendingPayload: String?
 
     init(baseURL: URL,
          token: String,
@@ -40,10 +46,15 @@ actor RelayPublisher {
     }
 
     func publish<T: Encodable>(_ value: T) async {
-        guard connected, let task else { return }
         guard let data = try? JSONEncoder().encode(value),
               let str = String(data: data, encoding: .utf8) else { return }
-        try? await task.send(.string(str))
+        if connected, let task {
+            try? await task.send(.string(str))
+        } else {
+            // Stash latest snapshot until the socket comes up. Only the most
+            // recent matters — older queued payloads are obsolete.
+            pendingPayload = str
+        }
     }
 
     // ─── connection ──────────────────────────────────────────────────────────
@@ -85,6 +96,13 @@ actor RelayPublisher {
         connected = true
         onState(true)
         reconnectDelay = 1  // only reset after a confirmed successful open
+
+        // Flush anything that was queued while we were disconnected. This is
+        // the catch-up after the start-up race and after any mid-show reconnect.
+        if let pending = pendingPayload {
+            try? await task.send(.string(pending))
+            pendingPayload = nil
+        }
 
         await readLoop()
     }
