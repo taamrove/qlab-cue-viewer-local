@@ -4,21 +4,23 @@ import OSLog
 
 private let log = Logger(subsystem: "as.trv.qlab-cue-viewer", category: "qlab")
 
-// QLab 5 OSC-over-UDP client.
+// QLab 5 OSC-over-TCP client (SLIP-framed).
 //
-// Protocol summary (what we actually use):
-//   • OSC binary packet = padded-string address, padded-string type tag
-//     (e.g. ",s"), then args.
-//   • With `/alwaysReply 1`, QLab replies to every command with an OSC message
-//     whose address is "/reply" + original address, carrying a single JSON
-//     string arg: `{"workspace_id":"…","address":"…","status":"ok","data":…}`.
-//   • Replies come back to the source port the request was sent from. NWConnection
-//     in UDP mode handles that automatically.
+// We started on OSC/UDP and hit macOS's net.inet.udp.maxdgram (9216 bytes by
+// default) — the kernel silently truncates anything larger, and QLab's reply
+// to /runningOrPausedCues for a moderately deep show easily blows past 13KB.
+// TCP is a stream with no per-message cap; QLab frames each OSC message with
+// SLIP (RFC 1055) so we can find message boundaries in the byte stream.
 //
-// v0 just polls a handful of /cue/playhead/… and /runningOrPausedCues addresses
-// at the configured interval and stitches the latest replies into a Snapshot.
-// We'll switch to push-style updates once API discovery tells us which ones
-// QLab will actually emit unprompted.
+// SLIP framing:
+//   • Each OSC packet is wrapped in 0xC0 (END) bytes at start and end.
+//   • Literal 0xC0 inside the payload is escaped as 0xDB 0xDC.
+//   • Literal 0xDB is escaped as 0xDB 0xDD.
+// (QLab tolerates a missing leading END; we always emit it for symmetry.)
+//
+// On the wire OSC is identical to the UDP transport — same address+typeTag+
+// args structure, same {workspace_id, address, status, data} JSON payload in
+// the single string arg of /reply messages.
 
 actor QLabClient {
     // Per-cue payload — what the viewer needs to draw one timeline lane.
@@ -28,11 +30,11 @@ actor QLabClient {
         let number: String?
         let type: String              // "Video", "Audio", "Memo", "Group", …
         let groupPath: [String]       // ancestor group names from outermost to immediate parent
-        let preWait: Double?          // seconds offset from group start before the cue fires
-        let preWaitElapsed: Double?   // how much of the preWait has elapsed (= countdown bar fill)
-        let duration: Double?         // seconds — total run length of the cue's action
-        let elapsed: Double?          // seconds since the cue's action started (post preWait)
-        let percent: Double?          // 0..1 progress (canonical for the bar fill)
+        let preWait: Double?
+        let preWaitElapsed: Double?
+        let duration: Double?
+        let elapsed: Double?
+        let percent: Double?
     }
 
     struct Snapshot: Codable, Equatable {
@@ -40,9 +42,6 @@ actor QLabClient {
         let activeName: String?
         let playheadName: String?
         let playheadNumber: String?
-        // Names of the running group ancestors of the leaf cues, outermost
-        // first — e.g. ["SHOW 1", "SONG"]. Lets the viewer show breadcrumb
-        // context above the playhead name.
         let groupPath: [String]
         let running: [CueInfo]
 
@@ -64,18 +63,14 @@ actor QLabClient {
     private let onSnapshot: @Sendable (Snapshot) -> Void
     private let onState: @Sendable (Bool) -> Void
 
-    // Two-socket setup because NWConnection in "connected UDP" mode filters
-    // incoming datagrams by source endpoint — and QLab replies from a port
-    // distinct from the request port. Sending via a connected NWConnection,
-    // receiving via an NWListener that accepts from any source, is the model
-    // that works with QLab 5.
-    private var sender: NWConnection?
-    private var listener: NWListener?
-    private var localPort: UInt16 = 0
+    private var conn: NWConnection?
     private var pollTask: Task<Void, Never>?
     private var isRunning = false
 
-    // address → most recent `data` value from QLab (any JSON type)
+    // SLIP receive buffer — accumulates stream bytes between END markers.
+    private var rxBuffer = Data()
+
+    // address (workspace-stripped) → most recent `data` value from QLab
     private var latest: [String: Any] = [:]
 
     init(host: String,
@@ -102,8 +97,8 @@ actor QLabClient {
     func stop() {
         isRunning = false
         pollTask?.cancel(); pollTask = nil
-        sender?.cancel(); sender = nil
-        listener?.cancel(); listener = nil
+        conn?.cancel(); conn = nil
+        rxBuffer.removeAll(keepingCapacity: false)
         onState(false)
     }
 
@@ -113,94 +108,55 @@ actor QLabClient {
             onState(false); return
         }
 
-        // ── Listener: accept incoming UDP from any source on an OS-picked
-        //    local port. This is what QLab will reply to.
-        let listener: NWListener
-        do {
-            listener = try NWListener(using: .udp)
-        } catch {
-            log.error("NWListener creation failed: \(error.localizedDescription, privacy: .public)")
-            onState(false)
-            if isRunning { await scheduleReconnect() }
-            return
-        }
-        self.listener = listener
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        self.conn = conn
 
-        let listenerReadyGate = OnceGate<Bool>()
-        listener.stateUpdateHandler = { state in
+        let readyGate = OnceGate<Bool>()
+        conn.stateUpdateHandler = { [weak self] state in
             switch state {
-            case .ready:              listenerReadyGate.fire(true)
-            case .failed, .cancelled: listenerReadyGate.fire(false)
-            default:                  break
+            case .ready:
+                readyGate.fire(true)
+            case .failed(let err):
+                log.error("TCP failed: \(err.localizedDescription, privacy: .public)")
+                readyGate.fire(false)
+                Task { await self?.handleDisconnect() }
+            case .cancelled:
+                readyGate.fire(false)
+            default:
+                break
             }
         }
-        listener.newConnectionHandler = { [weak self] newConn in
-            // QLab's source address shows up here. Each unique remote yields
-            // one connection. Start it and hand it to the actor for reads.
-            Task { await self?.acceptIncoming(newConn) }
-        }
-        listener.start(queue: .global(qos: .utility))
+        conn.start(queue: .global(qos: .utility))
 
-        guard await listenerReadyGate.wait(), isRunning else {
-            listener.cancel()
+        guard await readyGate.wait(), isRunning else {
+            conn.cancel()
             onState(false)
             if isRunning { await scheduleReconnect() }
             return
         }
-        localPort = listener.port?.rawValue ?? 0
-        guard localPort != 0 else {
-            log.error("Listener has no port after .ready — bailing")
-            listener.cancel()
-            onState(false)
-            if isRunning { await scheduleReconnect() }
-            return
-        }
-        log.info("Listening for QLab replies on UDP \(self.localPort)")
-
-        // ── Sender: connected NWConnection to QLab's request port.
-        let sender = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .udp)
-        self.sender = sender
-        let senderReadyGate = OnceGate<Bool>()
-        sender.stateUpdateHandler = { state in
-            switch state {
-            case .ready:              senderReadyGate.fire(true)
-            case .failed, .cancelled: senderReadyGate.fire(false)
-            default:                  break
-            }
-        }
-        sender.start(queue: .global(qos: .utility))
-        guard await senderReadyGate.wait(), isRunning else {
-            sender.cancel()
-            onState(false)
-            if isRunning { await scheduleReconnect() }
-            return
-        }
-        log.info("Sender ready to \(self.host, privacy: .public):\(self.port)")
+        log.info("TCP connected to \(self.host, privacy: .public):\(self.port)")
         onState(true)
 
-        announceReplyPort()
-        // alwaysReply first so /connect's response (with passcode-protected
-        // workspaces) actually comes back.
+        // Continuous read loop — pulls stream chunks and feeds the SLIP
+        // de-framer. Starts as soon as the connection is ready; QLab won't
+        // send anything until we send something first, but priming the loop
+        // means we never miss the first reply.
+        scheduleRead()
+
+        // /alwaysReply first so /connect's response on passcode-protected
+        // workspaces comes back.
         send(OSCMessage("/alwaysReply", args: [.int32(1)]))
         if !passcode.isEmpty {
             send(OSCMessage("/connect", args: [.string(passcode)]))
         }
-
         startPolling()
     }
 
-    // Handle a freshly-arriving remote (QLab). QLab uses a fresh ephemeral
-    // source port for every reply, so each "flow" delivers exactly one packet.
-    // Read it, process it, cancel the connection — otherwise we'd accumulate
-    // hundreds of dead NWConnection objects.
-    private func acceptIncoming(_ conn: NWConnection) {
-        conn.start(queue: .global(qos: .utility))
-        conn.receiveMessage { [weak self] content, _, _, _ in
-            if let data = content {
-                Task { await self?.handleReceived(data) }
-            }
-            conn.cancel()
-        }
+    private func handleDisconnect() async {
+        onState(false)
+        conn = nil
+        rxBuffer.removeAll(keepingCapacity: false)
+        if isRunning { await scheduleReconnect() }
     }
 
     private func scheduleReconnect() async {
@@ -211,13 +167,52 @@ actor QLabClient {
     // ─── send + receive ──────────────────────────────────────────────────────
 
     private func send(_ msg: OSCMessage) {
-        guard let sender else { return }
-        sender.send(content: msg.encoded, completion: .contentProcessed { _ in })
+        guard let conn else { return }
+        let framed = SLIP.encode(msg.encoded)
+        conn.send(content: framed, completion: .contentProcessed { err in
+            if let err {
+                log.error("TCP send failed: \(err.localizedDescription, privacy: .public)")
+            }
+        })
     }
 
-    private func announceReplyPort() {
-        guard localPort != 0 else { return }
-        send(OSCMessage("/udpReplyPort", args: [.int32(Int32(localPort))]))
+    private nonisolated func scheduleRead() {
+        Task { await self._scheduleRead() }
+    }
+
+    private func _scheduleRead() {
+        guard let conn else { return }
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, err in
+            if let data, !data.isEmpty {
+                Task { await self?.feed(data) }
+            }
+            if let err {
+                log.error("TCP receive: \(err.localizedDescription, privacy: .public)")
+                Task { await self?.handleDisconnect() }
+                return
+            }
+            if isComplete {
+                Task { await self?.handleDisconnect() }
+                return
+            }
+            // Re-arm
+            Task { await self?._scheduleRead() }
+        }
+    }
+
+    private func feed(_ chunk: Data) {
+        rxBuffer.append(chunk)
+        // Split on END bytes — each complete segment is one SLIP-encoded
+        // OSC message. Multiple messages can arrive in a single TCP read,
+        // and a single message can be split across reads.
+        while let endIdx = rxBuffer.firstIndex(of: SLIP.END) {
+            let segment = rxBuffer.subdata(in: rxBuffer.startIndex..<endIdx)
+            rxBuffer.removeSubrange(rxBuffer.startIndex...endIdx)
+            // Skip empty segments (the leading END byte of the next packet).
+            guard !segment.isEmpty else { continue }
+            let decoded = SLIP.decode(segment)
+            handleReceived(decoded)
+        }
     }
 
     private func handleReceived(_ data: Data) {
@@ -241,12 +236,8 @@ actor QLabClient {
         }
     }
 
-    // QLab reply addresses look like /workspace/<UUID>/cue/playhead/displayName,
-    // but we asked with /cue/playhead/displayName. Strip the workspace prefix
-    // so the cache key matches.
     private func stripWorkspacePrefix(_ s: String) -> String {
         if s.hasPrefix("/workspace/") {
-            // /workspace/<uuid>/...rest...
             let afterPrefix = s.dropFirst("/workspace/".count)
             if let slash = afterPrefix.firstIndex(of: "/") {
                 return String(afterPrefix[slash...])
@@ -269,20 +260,14 @@ actor QLabClient {
     }
 
     private func pollOnce() async {
-        // Re-stake our claim to QLab's reply port every cycle. Cheap (one
-        // tiny UDP packet) and immune to other OSC clients overriding it.
-        announceReplyPort()
-
         // First-tier queries: things that don't depend on knowing cue IDs.
         send(OSCMessage("/cue/playhead/displayName"))
         send(OSCMessage("/cue/playhead/number"))
         send(OSCMessage("/cue/active/displayName"))
         send(OSCMessage("/runningOrPausedCues"))
 
-        // Second-tier: per-cue duration / elapsed / progress for everything we
-        // know is running from the LAST tick. Means there's a one-poll lag
-        // before a fresh cue gets its progress data, which is fine for a 4 Hz
-        // refresh rate. Each cue costs 3 tiny UDP packets.
+        // Second-tier: per-cue duration / elapsed / progress for everything
+        // we know is running from the LAST tick.
         let (cues, groupPath) = flattenRunning(latest["/runningOrPausedCues"])
         for cue in cues {
             send(OSCMessage("/cue_id/\(cue.id)/preWait"))
@@ -292,8 +277,6 @@ actor QLabClient {
             send(OSCMessage("/cue_id/\(cue.id)/percentActionElapsed"))
         }
 
-        // Build snapshot from cache. Cues that haven't had their per-cue data
-        // come back yet appear with nil duration/elapsed/percent.
         let running: [CueInfo] = cues.map { stub in
             CueInfo(
                 id:             stub.id,
@@ -320,35 +303,22 @@ actor QLabClient {
         onSnapshot(snap)
     }
 
-    // Walk QLab's nested /runningOrPausedCues tree, return one flat entry per
-    // *leaf* cue (skipping Group / Cue List containers). The user wants lanes
-    // for things that actually produce output (Video, Audio, Memo, …), not
-    // for the groups holding them.
+    // ─── /runningOrPausedCues tree walking — same as UDP version ─────────────
+
     private struct RunningStub {
         let id, name, type: String
         let number: String?
-        let groupPath: [String]   // its parent chain — used to filter to the current song
+        let groupPath: [String]
     }
 
     private func flattenRunning(_ raw: Any?) -> ([RunningStub], [String]) {
         guard let arr = raw as? [[String: Any]] else { return ([], []) }
-        // QLab includes each running leaf cue multiple times — once at top
-        // level AND again nested inside each enclosing group. The paths
-        // differ per occurrence (e.g. SANG 3 might appear top-level with
-        // path=["SANG 3"] AND inside SHOW 1 with path=["SHOW 1","SANG 3"]).
-        // We need the LONGEST path so the viewer's filter has the right
-        // group hierarchy — a first-occurrence dedup would lock in the
-        // shorter top-level walk and the filter would never match.
         var occurrences: [RunningStub] = []
         var deepestPath: [String] = []
         for item in arr {
             let walked = collect(into: &occurrences, path: [], item)
             if walked.count > deepestPath.count { deepestPath = walked }
         }
-
-        // Post-pass dedup: keep the occurrence with the longest groupPath
-        // per uniqueID. Preserve first-encountered insertion order so the
-        // viewer renders cues in QLab's source order.
         var bestForId: [String: RunningStub] = [:]
         var orderedIds: [String] = []
         for stub in occurrences {
@@ -381,7 +351,6 @@ actor QLabClient {
             }
             return deepest
         }
-        // Leaf — record every occurrence (post-pass picks the best).
         guard let id = item["uniqueID"] as? String else { return path }
         let leafName = displayName ?? "Unnamed"
         let number = (item["number"] as? String).flatMap { $0.isEmpty ? nil : $0 }
@@ -395,6 +364,56 @@ actor QLabClient {
         if let i = raw as? Int { return Double(i) }
         if let s = raw as? String { return Double(s) }
         return nil
+    }
+}
+
+// MARK: - SLIP framing (RFC 1055)
+
+private enum SLIP {
+    static let END: UInt8 = 0xC0
+    static let ESC: UInt8 = 0xDB
+    static let ESC_END: UInt8 = 0xDC
+    static let ESC_ESC: UInt8 = 0xDD
+
+    /// Wrap `payload` with leading + trailing END markers and escape any
+    /// literal END/ESC bytes inside it.
+    static func encode(_ payload: Data) -> Data {
+        var out = Data()
+        out.reserveCapacity(payload.count + 4)
+        out.append(END)
+        for byte in payload {
+            switch byte {
+            case END: out.append(ESC); out.append(ESC_END)
+            case ESC: out.append(ESC); out.append(ESC_ESC)
+            default:  out.append(byte)
+            }
+        }
+        out.append(END)
+        return out
+    }
+
+    /// Un-escape the inside of a SLIP segment (the bytes BETWEEN END markers).
+    /// We pass these in already-split, so this routine doesn't look for END.
+    static func decode(_ segment: Data) -> Data {
+        var out = Data()
+        out.reserveCapacity(segment.count)
+        var i = segment.startIndex
+        while i < segment.endIndex {
+            let b = segment[i]
+            if b == ESC, segment.index(after: i) < segment.endIndex {
+                let next = segment[segment.index(after: i)]
+                switch next {
+                case ESC_END: out.append(END)
+                case ESC_ESC: out.append(ESC)
+                default:      out.append(next)   // tolerant: pass through
+                }
+                i = segment.index(i, offsetBy: 2)
+            } else {
+                out.append(b)
+                i = segment.index(after: i)
+            }
+        }
+        return out
     }
 }
 
@@ -429,7 +448,6 @@ private final class OnceGate<T>: @unchecked Sendable {
         }
     }
 
-    // Sugar for `await withCheckedContinuation { gate.attach($0) }`.
     func wait() async -> T {
         await withCheckedContinuation { (cont: CheckedContinuation<T, Never>) in
             attach(cont)
@@ -439,10 +457,8 @@ private final class OnceGate<T>: @unchecked Sendable {
 
 // MARK: - OSC binary encoding (the minimum we need)
 //
-// We only emit `/address` with optional int32 and string args, and only parse
-// QLab replies (single string arg containing JSON). A real OSC library would
-// support floats, blobs, timetags, bundles, etc. — we don't need them for the
-// query/reply traffic this bridge does.
+// Identical to the UDP version: emit /address with optional int32/string args;
+// parse QLab replies (single string arg containing JSON).
 
 struct OSCMessage {
     enum Arg { case int32(Int32); case string(String) }
@@ -455,8 +471,6 @@ struct OSCMessage {
         self.args = args
     }
 
-    // Encode → Data. Strings are null-terminated and padded to a 4-byte
-    // boundary; ints are big-endian; type tag string starts with ','.
     var encoded: Data {
         var data = Data()
         data.append(Self.padString(address))
@@ -488,8 +502,6 @@ struct OSCMessage {
         return d
     }
 
-    // Decode → Message. We only need address + the first string arg in QLab's
-    // reply path, but we parse all args we recognize for completeness.
     static func decode(_ data: Data) -> OSCMessage? {
         var cursor = data.startIndex
         guard let address = readPaddedString(data, &cursor) else { return nil }
@@ -508,7 +520,6 @@ struct OSCMessage {
                 guard let s = readPaddedString(data, &cursor) else { return nil }
                 args.append(.string(s))
             default:
-                // Unknown type — bail rather than mis-parse the rest.
                 return OSCMessage(address, args: args)
             }
         }
@@ -521,8 +532,8 @@ struct OSCMessage {
         while end < data.endIndex, data[end] != 0 { end += 1 }
         guard end < data.endIndex else { return nil }
         let s = String(data: data[cursor..<end], encoding: .utf8) ?? ""
-        let strLen = end - cursor + 1               // include the null
-        let padded = strLen + (4 - strLen % 4) % 4  // up to next 4-byte boundary
+        let strLen = end - cursor + 1
+        let padded = strLen + (4 - strLen % 4) % 4
         cursor += padded
         return s
     }

@@ -6,8 +6,8 @@
   <key>CFBundleIdentifier</key><string>as.trv.qlab-cue-viewer</string>
   <key>CFBundleName</key><string>QLab Cue Viewer</string>
   <key>CFBundleDisplayName</key><string>QLab Cue Viewer</string>
-  <key>CFBundleShortVersionString</key><string>0.1.4</string>
-  <key>CFBundleVersion</key><string>5</string>
+  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleVersion</key><string>6</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
