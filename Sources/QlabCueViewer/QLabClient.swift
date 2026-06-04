@@ -27,6 +27,7 @@ actor QLabClient {
         let name: String
         let number: String?
         let type: String              // "Video", "Audio", "Memo", "Group", …
+        let groupPath: [String]       // ancestor group names from outermost to immediate parent
         let preWait: Double?          // seconds offset from group start before the cue fires
         let preWaitElapsed: Double?   // how much of the preWait has elapsed (= countdown bar fill)
         let duration: Double?         // seconds — total run length of the cue's action
@@ -299,6 +300,7 @@ actor QLabClient {
                 name:           stub.name,
                 number:         stub.number,
                 type:           stub.type,
+                groupPath:      stub.groupPath,
                 preWait:        numberValue(latest["/cue_id/\(stub.id)/preWait"]),
                 preWaitElapsed: numberValue(latest["/cue_id/\(stub.id)/preWaitElapsed"]),
                 duration:       numberValue(latest["/cue_id/\(stub.id)/duration"]),
@@ -322,7 +324,11 @@ actor QLabClient {
     // *leaf* cue (skipping Group / Cue List containers). The user wants lanes
     // for things that actually produce output (Video, Audio, Memo, …), not
     // for the groups holding them.
-    private struct RunningStub { let id, name, type: String; let number: String? }
+    private struct RunningStub {
+        let id, name, type: String
+        let number: String?
+        let groupPath: [String]   // its parent chain — used to filter to the current song
+    }
 
     private func flattenRunning(_ raw: Any?) -> ([RunningStub], [String]) {
         guard let arr = raw as? [[String: Any]] else { return ([], []) }
@@ -367,7 +373,7 @@ actor QLabClient {
         let leafName = displayName ?? "Unnamed"
         let number = (item["number"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         let type = (item["type"] as? String) ?? "Cue"
-        out.append(RunningStub(id: id, name: leafName, type: type, number: number))
+        out.append(RunningStub(id: id, name: leafName, type: type, number: number, groupPath: path))
         return path
     }
 
