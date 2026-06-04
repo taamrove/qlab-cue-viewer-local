@@ -266,9 +266,28 @@ actor QLabClient {
         send(OSCMessage("/cue/active/displayName"))
         send(OSCMessage("/runningOrPausedCues"))
 
+        let (cues, groupPath) = flattenRunning(latest["/runningOrPausedCues"])
+
+        // Cache hygiene: evict any cached /cue_id/<uuid>/... entries whose
+        // cue is no longer in the running list. Without this, a cue that
+        // briefly leaves and comes back (or a different cue at the same
+        // uniqueID after a workspace reload) would publish using stale
+        // values from a previous run, briefly placing the bar in the wrong
+        // spot or mis-classifying duration.
+        let runningIds = Set(cues.map { $0.id })
+        for key in Array(latest.keys) where key.hasPrefix("/cue_id/") {
+            // Key shape: "/cue_id/<UUID>/<property>". Pull out <UUID>.
+            let after = key.dropFirst("/cue_id/".count)
+            if let slash = after.firstIndex(of: "/") {
+                let id = String(after[..<slash])
+                if !runningIds.contains(id) {
+                    latest.removeValue(forKey: key)
+                }
+            }
+        }
+
         // Second-tier: per-cue duration / elapsed / progress for everything
         // we know is running from the LAST tick.
-        let (cues, groupPath) = flattenRunning(latest["/runningOrPausedCues"])
         for cue in cues {
             send(OSCMessage("/cue_id/\(cue.id)/preWait"))
             send(OSCMessage("/cue_id/\(cue.id)/preWaitElapsed"))
@@ -277,16 +296,26 @@ actor QLabClient {
             send(OSCMessage("/cue_id/\(cue.id)/percentActionElapsed"))
         }
 
-        let running: [CueInfo] = cues.map { stub in
-            CueInfo(
+        // First-sight gate: drop any cue whose static-ish properties
+        // (preWait OR duration) haven't replied yet. The first poll tick
+        // after a cue appears would otherwise publish it with nil-everywhere
+        // and the viewer would briefly treat it as an instant cue anchored
+        // at the song's start — exactly the "phantom flash" we hit when
+        // clicking through cues fast. One ~250ms poll cycle later, the
+        // properties are back and the cue lands properly.
+        let running: [CueInfo] = cues.compactMap { stub in
+            let pw  = numberValue(latest["/cue_id/\(stub.id)/preWait"])
+            let dur = numberValue(latest["/cue_id/\(stub.id)/duration"])
+            guard pw != nil || dur != nil else { return nil }
+            return CueInfo(
                 id:             stub.id,
                 name:           stub.name,
                 number:         stub.number,
                 type:           stub.type,
                 groupPath:      stub.groupPath,
-                preWait:        numberValue(latest["/cue_id/\(stub.id)/preWait"]),
+                preWait:        pw,
                 preWaitElapsed: numberValue(latest["/cue_id/\(stub.id)/preWaitElapsed"]),
-                duration:       numberValue(latest["/cue_id/\(stub.id)/duration"]),
+                duration:       dur,
                 elapsed:        numberValue(latest["/cue_id/\(stub.id)/actionElapsed"]),
                 percent:        numberValue(latest["/cue_id/\(stub.id)/percentActionElapsed"])
             )
