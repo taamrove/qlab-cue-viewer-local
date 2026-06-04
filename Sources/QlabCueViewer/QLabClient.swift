@@ -39,6 +39,10 @@ actor QLabClient {
         let activeName: String?
         let playheadName: String?
         let playheadNumber: String?
+        // Names of the running group ancestors of the leaf cues, outermost
+        // first — e.g. ["SHOW 1", "SONG"]. Lets the viewer show breadcrumb
+        // context above the playhead name.
+        let groupPath: [String]
         let running: [CueInfo]
 
         // Exclude `ts` from equality so identical state across polls dedupes
@@ -47,6 +51,7 @@ actor QLabClient {
             lhs.activeName == rhs.activeName
                 && lhs.playheadName == rhs.playheadName
                 && lhs.playheadNumber == rhs.playheadNumber
+                && lhs.groupPath == rhs.groupPath
                 && lhs.running == rhs.running
         }
     }
@@ -277,7 +282,7 @@ actor QLabClient {
         // know is running from the LAST tick. Means there's a one-poll lag
         // before a fresh cue gets its progress data, which is fine for a 4 Hz
         // refresh rate. Each cue costs 3 tiny UDP packets.
-        let cues = flattenRunning(latest["/runningOrPausedCues"])
+        let (cues, groupPath) = flattenRunning(latest["/runningOrPausedCues"])
         for cue in cues {
             send(OSCMessage("/cue_id/\(cue.id)/preWait"))
             send(OSCMessage("/cue_id/\(cue.id)/preWaitElapsed"))
@@ -307,7 +312,8 @@ actor QLabClient {
             activeName:     latest["/cue/active/displayName"]   as? String,
             playheadName:   latest["/cue/playhead/displayName"] as? String,
             playheadNumber: latest["/cue/playhead/number"]      as? String,
-            running: running
+            groupPath:      groupPath,
+            running:        running
         )
         onSnapshot(snap)
     }
@@ -318,36 +324,51 @@ actor QLabClient {
     // for the groups holding them.
     private struct RunningStub { let id, name, type: String; let number: String? }
 
-    private func flattenRunning(_ raw: Any?) -> [RunningStub] {
-        guard let arr = raw as? [[String: Any]] else { return [] }
+    private func flattenRunning(_ raw: Any?) -> ([RunningStub], [String]) {
+        guard let arr = raw as? [[String: Any]] else { return ([], []) }
         // /runningOrPausedCues returns each running cue at the top level AND
         // again nested inside its parent group, so a naive walk yields each
         // leaf twice. Dedup by uniqueID, keeping the first occurrence (which
-        // preserves the source order QLab gave us).
+        // preserves the source order QLab gave us). At the same time, track
+        // the deepest group-name chain we walk through so the viewer can show
+        // a "SHOW 1 › SONG" style breadcrumb.
         var out: [RunningStub] = []
         var seen = Set<String>()
+        var deepestPath: [String] = []
         for item in arr {
-            collect(into: &out, seen: &seen, item)
+            let walked = collect(into: &out, seen: &seen, path: [], item)
+            if walked.count > deepestPath.count { deepestPath = walked }
         }
-        return out
+        return (out, deepestPath)
     }
 
+    @discardableResult
     private func collect(into out: inout [RunningStub],
                          seen: inout Set<String>,
-                         _ item: [String: Any]) {
+                         path: [String],
+                         _ item: [String: Any]) -> [String] {
         let children = item["cues"] as? [[String: Any]] ?? []
+        let displayName = (item["listName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            ?? (item["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+
         if !children.isEmpty {
-            for child in children { collect(into: &out, seen: &seen, child) }
-            return
+            // It's a group — recurse with its name appended to the path.
+            let newPath = displayName.map { path + [$0] } ?? path
+            var deepest = newPath
+            for child in children {
+                let walked = collect(into: &out, seen: &seen, path: newPath, child)
+                if walked.count > deepest.count { deepest = walked }
+            }
+            return deepest
         }
-        guard let id = item["uniqueID"] as? String, !seen.contains(id) else { return }
+        // Leaf — record it; the path we got is its parent chain.
+        guard let id = item["uniqueID"] as? String, !seen.contains(id) else { return path }
         seen.insert(id)
-        let name = (item["listName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-            ?? (item["name"] as? String)
-            ?? "Unnamed"
+        let leafName = displayName ?? "Unnamed"
         let number = (item["number"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         let type = (item["type"] as? String) ?? "Cue"
-        out.append(RunningStub(id: id, name: name, type: type, number: number))
+        out.append(RunningStub(id: id, name: leafName, type: type, number: number))
+        return path
     }
 
     private func numberValue(_ raw: Any?) -> Double? {
