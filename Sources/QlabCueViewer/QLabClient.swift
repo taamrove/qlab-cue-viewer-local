@@ -332,25 +332,40 @@ actor QLabClient {
 
     private func flattenRunning(_ raw: Any?) -> ([RunningStub], [String]) {
         guard let arr = raw as? [[String: Any]] else { return ([], []) }
-        // /runningOrPausedCues returns each running cue at the top level AND
-        // again nested inside its parent group, so a naive walk yields each
-        // leaf twice. Dedup by uniqueID, keeping the first occurrence (which
-        // preserves the source order QLab gave us). At the same time, track
-        // the deepest group-name chain we walk through so the viewer can show
-        // a "SHOW 1 › SONG" style breadcrumb.
-        var out: [RunningStub] = []
-        var seen = Set<String>()
+        // QLab includes each running leaf cue multiple times — once at top
+        // level AND again nested inside each enclosing group. The paths
+        // differ per occurrence (e.g. SANG 3 might appear top-level with
+        // path=["SANG 3"] AND inside SHOW 1 with path=["SHOW 1","SANG 3"]).
+        // We need the LONGEST path so the viewer's filter has the right
+        // group hierarchy — a first-occurrence dedup would lock in the
+        // shorter top-level walk and the filter would never match.
+        var occurrences: [RunningStub] = []
         var deepestPath: [String] = []
         for item in arr {
-            let walked = collect(into: &out, seen: &seen, path: [], item)
+            let walked = collect(into: &occurrences, path: [], item)
             if walked.count > deepestPath.count { deepestPath = walked }
         }
-        return (out, deepestPath)
+
+        // Post-pass dedup: keep the occurrence with the longest groupPath
+        // per uniqueID. Preserve first-encountered insertion order so the
+        // viewer renders cues in QLab's source order.
+        var bestForId: [String: RunningStub] = [:]
+        var orderedIds: [String] = []
+        for stub in occurrences {
+            if let existing = bestForId[stub.id] {
+                if stub.groupPath.count > existing.groupPath.count {
+                    bestForId[stub.id] = stub
+                }
+            } else {
+                orderedIds.append(stub.id)
+                bestForId[stub.id] = stub
+            }
+        }
+        return (orderedIds.compactMap { bestForId[$0] }, deepestPath)
     }
 
     @discardableResult
     private func collect(into out: inout [RunningStub],
-                         seen: inout Set<String>,
                          path: [String],
                          _ item: [String: Any]) -> [String] {
         let children = item["cues"] as? [[String: Any]] ?? []
@@ -358,18 +373,16 @@ actor QLabClient {
             ?? (item["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
 
         if !children.isEmpty {
-            // It's a group — recurse with its name appended to the path.
             let newPath = displayName.map { path + [$0] } ?? path
             var deepest = newPath
             for child in children {
-                let walked = collect(into: &out, seen: &seen, path: newPath, child)
+                let walked = collect(into: &out, path: newPath, child)
                 if walked.count > deepest.count { deepest = walked }
             }
             return deepest
         }
-        // Leaf — record it; the path we got is its parent chain.
-        guard let id = item["uniqueID"] as? String, !seen.contains(id) else { return path }
-        seen.insert(id)
+        // Leaf — record every occurrence (post-pass picks the best).
+        guard let id = item["uniqueID"] as? String else { return path }
         let leafName = displayName ?? "Unnamed"
         let number = (item["number"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         let type = (item["type"] as? String) ?? "Cue"
