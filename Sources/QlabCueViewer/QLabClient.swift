@@ -37,6 +37,25 @@ actor QLabClient {
         let percent: Double?
     }
 
+    // The whole cue list, slimmed to what a viewer needs to draw it. QLab's
+    // own /cueLists reply carries every property of every cue; for a deep show
+    // that is far too much to put on the wire four times a second, so this
+    // keeps only identity and nesting.
+    struct WorkspaceCue: Codable, Equatable {
+        let id: String
+        let number: String?
+        let name: String
+        let type: String
+        let cues: [WorkspaceCue]?
+    }
+
+    // Published on its own, not folded into Snapshot: the structure changes
+    // rarely and is orders of magnitude larger than the running state.
+    struct WorkspaceMessage: Codable, Equatable {
+        let ts: Double
+        let workspace: [WorkspaceCue]
+    }
+
     struct Snapshot: Codable, Equatable {
         let ts: Double
         let activeName: String?
@@ -67,6 +86,7 @@ actor QLabClient {
     private let passcode: String
     private let pollInterval: TimeInterval
     private let onSnapshot: @Sendable (Snapshot) -> Void
+    private let onWorkspace: @Sendable (WorkspaceMessage) -> Void
     private let onState: @Sendable (Bool) -> Void
 
     private var conn: NWConnection?
@@ -79,17 +99,27 @@ actor QLabClient {
     // address (workspace-stripped) → most recent `data` value from QLab
     private var latest: [String: Any] = [:]
 
+    // Structure publishing state. The tree is re-sent on change, and otherwise
+    // on a slow heartbeat — the relay only caches the most recent message per
+    // channel, so a viewer that joins mid-show would otherwise never receive a
+    // structure that happens not to be changing.
+    private var lastWorkspace: [WorkspaceCue] = []
+    private var lastWorkspacePublish: Date = .distantPast
+    private var pollTick = 0
+
     init(host: String,
          port: UInt16,
          passcode: String,
          pollInterval: TimeInterval,
          onSnapshot: @escaping @Sendable (Snapshot) -> Void,
+         onWorkspace: @escaping @Sendable (WorkspaceMessage) -> Void,
          onState: @escaping @Sendable (Bool) -> Void) {
         self.host = host
         self.port = port
         self.passcode = passcode
         self.pollInterval = pollInterval
         self.onSnapshot = onSnapshot
+        self.onWorkspace = onWorkspace
         self.onState = onState
     }
 
@@ -266,6 +296,16 @@ actor QLabClient {
     }
 
     private func pollOnce() async {
+        pollTick += 1
+
+        // The full cue list is asked for far less often than the running
+        // state; it is much bigger and changes only when the operator edits
+        // the workspace.
+        if pollTick % workspaceEveryNTicks == 1 {
+            send(OSCMessage("/cueLists"))
+        }
+        publishWorkspaceIfNeeded()
+
         // First-tier queries: things that don't depend on knowing cue IDs.
         send(OSCMessage("/cue/playhead/displayName"))
         send(OSCMessage("/cue/playhead/number"))
@@ -337,6 +377,44 @@ actor QLabClient {
             timecode:       nil
         )
         onSnapshot(snap)
+    }
+
+    // ─── workspace structure ─────────────────────────────────────────────────
+
+    // Roughly every 5 seconds at the default 250 ms poll.
+    private var workspaceEveryNTicks: Int { max(1, Int(5.0 / max(pollInterval, 0.05))) }
+
+    private func publishWorkspaceIfNeeded() {
+        let tree = buildWorkspace(latest["/cueLists"])
+        guard !tree.isEmpty else { return }
+
+        let changed = tree != lastWorkspace
+        let stale = Date().timeIntervalSince(lastWorkspacePublish) > 15
+        guard changed || stale else { return }
+
+        lastWorkspace = tree
+        lastWorkspacePublish = Date()
+        onWorkspace(WorkspaceMessage(ts: Date().timeIntervalSince1970 * 1000, workspace: tree))
+    }
+
+    private func buildWorkspace(_ raw: Any?) -> [WorkspaceCue] {
+        guard let arr = raw as? [[String: Any]] else { return [] }
+        return arr.compactMap(workspaceCue)
+    }
+
+    private func workspaceCue(_ item: [String: Any]) -> WorkspaceCue? {
+        guard let id = item["uniqueID"] as? String else { return nil }
+        let name = (item["listName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            ?? (item["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            ?? "Unnamed"
+        let children = (item["cues"] as? [[String: Any]])?.compactMap(workspaceCue)
+        return WorkspaceCue(
+            id:     id,
+            number: (item["number"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+            name:   name,
+            type:   (item["type"] as? String) ?? "Cue",
+            cues:   (children?.isEmpty ?? true) ? nil : children
+        )
     }
 
     // ─── /runningOrPausedCues tree walking — same as UDP version ─────────────

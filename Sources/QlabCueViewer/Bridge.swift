@@ -91,6 +91,11 @@ final class Bridge: ObservableObject {
                     Task { await relay.publish(merged) }
                 }
             },
+            onWorkspace: { snap in
+                // Straight through: the structure carries no timecode and
+                // doesn't participate in the snapshot dedupe.
+                Task { await relay.publish(snap) }
+            },
             onState: { [weak self] up in
                 Task { @MainActor in self?.qlabState = up ? .on : .off }
             }
