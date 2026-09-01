@@ -54,6 +54,10 @@ actor QLabClient {
     struct WorkspaceMessage: Codable, Equatable {
         let ts: Double
         let workspace: [WorkspaceCue]
+        // Which of the top-level lists QLab currently has open. A show
+        // workspace usually holds a library and a helpers list alongside the
+        // one being performed, and only the performed one is worth showing.
+        let currentListId: String?
     }
 
     struct Snapshot: Codable, Equatable {
@@ -69,6 +73,17 @@ actor QLabClient {
         // happen after the poll builds the rest of the snapshot.
         var timecode: TimecodeInfo?
 
+        // Carried on every snapshot as well as with the structure, so the
+        // viewer switches lists the moment QLab does rather than waiting for
+        // the next structure send.
+        let currentListId: String?
+
+        // What is standing by and what the operator has highlighted — neither
+        // of which is playing, and both of which matter when you're watching a
+        // show rather than driving it.
+        let playheadId: String?
+        let selectedIds: [String]
+
         // Exclude `ts` from equality so identical state across polls dedupes
         // and the menu doesn't redraw 4× per second.
         static func == (lhs: Snapshot, rhs: Snapshot) -> Bool {
@@ -78,6 +93,9 @@ actor QLabClient {
                 && lhs.groupPath == rhs.groupPath
                 && lhs.running == rhs.running
                 && lhs.timecode == rhs.timecode
+                && lhs.currentListId == rhs.currentListId
+                && lhs.playheadId == rhs.playheadId
+                && lhs.selectedIds == rhs.selectedIds
         }
     }
 
@@ -307,6 +325,9 @@ actor QLabClient {
         publishWorkspaceIfNeeded()
 
         // First-tier queries: things that don't depend on knowing cue IDs.
+        send(OSCMessage("/currentCueListID"))
+        send(OSCMessage("/cue/playhead/uniqueID"))
+        send(OSCMessage("/selectedCues/uniqueIDs/shallow"))
         send(OSCMessage("/cue/playhead/displayName"))
         send(OSCMessage("/cue/playhead/number"))
         send(OSCMessage("/cue/active/displayName"))
@@ -374,7 +395,10 @@ actor QLabClient {
             playheadNumber: latest["/cue/playhead/number"]      as? String,
             groupPath:      groupPath,
             running:        running,
-            timecode:       nil
+            timecode:       nil,
+            currentListId:  currentListId(),
+            playheadId:     (latest["/cue/playhead/uniqueID"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+            selectedIds:    cueIds(latest["/selectedCues/uniqueIDs/shallow"])
         )
         onSnapshot(snap)
     }
@@ -383,6 +407,22 @@ actor QLabClient {
 
     // Roughly every 5 seconds at the default 250 ms poll.
     private var workspaceEveryNTicks: Int { max(1, Int(5.0 / max(pollInterval, 0.05))) }
+
+    // QLab's id-only replies come back either as bare strings or as objects
+    // carrying a uniqueID, depending on the message; accept both rather than
+    // betting on one shape.
+    private func cueIds(_ raw: Any?) -> [String] {
+        guard let arr = raw as? [Any] else { return [] }
+        return arr.compactMap { item in
+            if let s = item as? String { return s.isEmpty ? nil : s }
+            if let d = item as? [String: Any] { return d["uniqueID"] as? String }
+            return nil
+        }
+    }
+
+    private func currentListId() -> String? {
+        (latest["/currentCueListID"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    }
 
     private func publishWorkspaceIfNeeded() {
         let tree = buildWorkspace(latest["/cueLists"])
@@ -396,7 +436,9 @@ actor QLabClient {
 
         lastWorkspace = tree
         lastWorkspacePublish = Date()
-        onWorkspace(WorkspaceMessage(ts: Date().timeIntervalSince1970 * 1000, workspace: tree))
+        onWorkspace(WorkspaceMessage(ts: Date().timeIntervalSince1970 * 1000,
+                                     workspace: tree,
+                                     currentListId: currentListId()))
     }
 
     private func buildWorkspace(_ raw: Any?) -> [WorkspaceCue] {
