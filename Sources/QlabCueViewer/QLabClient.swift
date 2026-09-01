@@ -46,6 +46,15 @@ actor QLabClient {
         let number: String?
         let name: String
         let type: String
+        // Overview detail for people watching from somewhere other than the
+        // QLab machine. All optional: QLab's cue-list reply carries some of
+        // these and not others, and the shape differs by cue type, so anything
+        // absent is simply omitted rather than guessed at.
+        let duration: Double?
+        let colorName: String?
+        let armed: Bool?
+        let flagged: Bool?
+        let mode: Int?              // group cues: how children fire
         let cues: [WorkspaceCue]?
     }
 
@@ -121,6 +130,8 @@ actor QLabClient {
     // on a slow heartbeat — the relay only caches the most recent message per
     // channel, so a viewer that joins mid-show would otherwise never receive a
     // structure that happens not to be changing.
+    private var durations: [String: Double] = [:]
+    private var durationCursor = 0
     private var lastWorkspace: [WorkspaceCue] = []
     private var lastWorkspacePublish: Date = .distantPast
     private var pollTick = 0
@@ -286,6 +297,14 @@ actor QLabClient {
             }
             if let value = obj["data"] {
                 latest[askedFor] = value
+
+                // Durations are kept in their own cache. The per-cue entries in
+                // `latest` are evicted for anything that isn't running, which
+                // is every cue in the list we're describing.
+                if askedFor.hasPrefix("/cue_id/"), askedFor.hasSuffix("/duration") {
+                    let body = askedFor.dropFirst("/cue_id/".count).dropLast("/duration".count)
+                    if !body.isEmpty, let d = numberValue(value) { durations[String(body)] = d }
+                }
             }
         }
     }
@@ -425,8 +444,13 @@ actor QLabClient {
     }
 
     private func publishWorkspaceIfNeeded() {
-        let tree = buildWorkspace(latest["/cueLists"])
+        var tree = buildWorkspace(latest["/cueLists"])
         guard !tree.isEmpty else { return }
+
+        // Ask for the next slice of durations, then rebuild so anything that
+        // arrived since the last pass is included in what goes out.
+        refreshDurations(tree)
+        tree = buildWorkspace(latest["/cueLists"])
 
         let changed = tree != lastWorkspace
         // Short enough that a viewer joining mid-show fills its panel promptly,
@@ -452,13 +476,57 @@ actor QLabClient {
             ?? (item["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             ?? "Unnamed"
         let children = (item["cues"] as? [[String: Any]])?.compactMap(workspaceCue)
+
+        // Duration isn't in the cue-list reply, so it's filled from the
+        // separately-fetched cache; anything else QLab happens to include is
+        // taken straight from the listing.
         return WorkspaceCue(
-            id:     id,
-            number: (item["number"] as? String).flatMap { $0.isEmpty ? nil : $0 },
-            name:   name,
-            type:   (item["type"] as? String) ?? "Cue",
-            cues:   (children?.isEmpty ?? true) ? nil : children
+            id:        id,
+            number:    (item["number"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+            name:      name,
+            type:      (item["type"] as? String) ?? "Cue",
+            duration:  durations[id] ?? numberValue(item["duration"]),
+            colorName: (item["colorName"] as? String).flatMap { $0 == "none" || $0.isEmpty ? nil : $0 },
+            armed:     item["armed"] as? Bool,
+            flagged:   item["flagged"] as? Bool,
+            mode:      (item["mode"] as? Int) ?? (item["mode"] as? NSNumber)?.intValue,
+            cues:      (children?.isEmpty ?? true) ? nil : children
         )
+    }
+
+    // ─── durations ───────────────────────────────────────────────────────────
+    //
+    // QLab's cue-list reply doesn't carry durations, and asking for all of them
+    // every poll would be hundreds of messages a second on a real show. Instead
+    // a slice of the current list is refreshed each tick, so the whole list
+    // fills within a second or two and then stays current cheaply.
+
+    private func refreshDurations(_ tree: [WorkspaceCue]) {
+        guard let listId = currentListId() else { return }
+        var ids: [String] = []
+        func collect(_ cues: [WorkspaceCue]) {
+            for c in cues {
+                ids.append(c.id)
+                if let kids = c.cues { collect(kids) }
+            }
+        }
+        for list in tree where list.id == listId { collect(list.cues ?? []) }
+        guard !ids.isEmpty else { return }
+
+        // Drop cues that have left the workspace so the cache can't grow
+        // without bound across a long run of workspace edits.
+        if durations.count > ids.count * 2 {
+            let live = Set(ids)
+            durations = durations.filter { live.contains($0.key) }
+        }
+
+        // Ask for the next slice, wrapping around.
+        let slice = 25
+        if durationCursor >= ids.count { durationCursor = 0 }
+        for id in ids[durationCursor ..< min(durationCursor + slice, ids.count)] {
+            send(OSCMessage("/cue_id/\(id)/duration"))
+        }
+        durationCursor += slice
     }
 
     // ─── /runningOrPausedCues tree walking — same as UDP version ─────────────
