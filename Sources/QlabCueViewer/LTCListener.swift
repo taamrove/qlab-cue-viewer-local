@@ -39,6 +39,7 @@ final class LTCListener: @unchecked Sendable {
         var seq: Int32
         var at: Date
         var lastLockedAt: Date?     // when this sender was last actually moving
+        var lockedSince: Date?      // when it STARTED moving; nil while stopped
     }
 
     // A frame is "current" for a little longer than one frame at any sane rate,
@@ -137,6 +138,16 @@ final class LTCListener: @unchecked Sendable {
 
         let now = Date()
         let locked = flags & 1 != 0
+        let previous = senders[id]
+
+        // Stamp when this sender STARTED running, and leave it alone for as
+        // long as it keeps running. That timestamp is what makes the choice
+        // below stable — see current().
+        let lockedSince: Date?
+        if !locked                          { lockedSince = nil }
+        else if previous?.locked == true    { lockedSince = previous?.lockedSince ?? now }
+        else                                { lockedSince = now }
+
         senders[id] = Sender(text: text,
                              fpsX100: Int(fps),
                              dropFrame: flags & 2 != 0,
@@ -144,7 +155,8 @@ final class LTCListener: @unchecked Sendable {
                              label: label,
                              seq: seq,
                              at: now,
-                             lastLockedAt: locked ? now : senders[id]?.lastLockedAt)
+                             lastLockedAt: locked ? now : previous?.lastLockedAt,
+                             lockedSince: lockedSince)
     }
 
     // ─── what the bridge publishes ───────────────────────────────────────────
@@ -156,7 +168,16 @@ final class LTCListener: @unchecked Sendable {
         senders = senders.filter { now.timeIntervalSince($0.value.at) < Self.frozenWindow }
 
         // Several cues can be running at once, so several plug-in instances can
-        // be sending. Whichever is actually moving wins.
+        // be sending — and at a song change the outgoing cue is usually still
+        // sounding while the next one starts.
+        //
+        // Pick the one that started running most recently, NOT the one heard
+        // from most recently. Two locked senders on independent 30 Hz timers
+        // interleave their packets, so "freshest packet" alternates between
+        // them several times a second and the readout flips between two songs'
+        // timecodes — which is exactly what a jumping hour digit looks like.
+        // `lockedSince` doesn't change while a sender keeps running, so this
+        // switches once, cleanly, to the cue that just started.
         let live = senders.values.filter { $0.locked && now.timeIntervalSince($0.at) < Self.liveWindow }
 
         // When nothing is moving, freeze on the one that ran most recently —
@@ -167,7 +188,9 @@ final class LTCListener: @unchecked Sendable {
             .filter { $0.lastLockedAt != nil }
             .max { ($0.lastLockedAt ?? .distantPast) < ($1.lastLockedAt ?? .distantPast) }
 
-        guard let best = live.max(by: { $0.at < $1.at })
+        let newest = live.max { ($0.lockedSince ?? .distantPast) < ($1.lockedSince ?? .distantPast) }
+
+        guard let best = newest
                       ?? lastRan
                       ?? senders.values.max(by: { $0.at < $1.at })
         else { return nil }
