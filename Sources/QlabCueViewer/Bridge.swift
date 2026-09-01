@@ -20,6 +20,7 @@ final class Bridge: ObservableObject {
 
     private var qlab: QLabClient?
     private var relay: RelayPublisher?
+    private var lastSnapshotPublishAt: Date = .distantPast
     private let ltc = LTCListener()
 
     init() {
@@ -85,16 +86,32 @@ final class Bridge: ObservableObject {
                     // resetting selection on every idle poll. A running
                     // timecode counts as a difference, so it keeps flowing at
                     // the poll rate; a stopped one settles and goes quiet again.
-                    guard self.lastSnapshot != merged else { return }
+                    //
+                    // But it must not go quiet forever: the relay hands a
+                    // joining viewer only the most recently cached message, so
+                    // an idle show has to keep state on the wire.
+                    let changed = self.lastSnapshot != merged
+                    let stale = Date().timeIntervalSince(self.lastSnapshotPublishAt) > 1.0
+                    guard changed || stale else { return }
                     self.lastSnapshot = merged
+                    self.lastSnapshotPublishAt = Date()
                     self.lastPublishedAt = Date()
                     Task { await relay.publish(merged) }
                 }
             },
-            onWorkspace: { snap in
-                // Straight through: the structure carries no timecode and
-                // doesn't participate in the snapshot dedupe.
-                Task { await relay.publish(snap) }
+            onWorkspace: { [weak self] structure in
+                Task { @MainActor in
+                    await relay.publish(structure)
+                    // The relay caches exactly one message per channel, so the
+                    // structure send evicts the cached snapshot. Put state back
+                    // on top immediately, or a viewer joining while QLab sits
+                    // idle receives the cue list and no running state at all —
+                    // and sits on "waiting for cues" indefinitely, because an
+                    // unchanging snapshot is never republished.
+                    if let snap = self?.lastSnapshot {
+                        await relay.publish(snap)
+                    }
+                }
             },
             onState: { [weak self] up in
                 Task { @MainActor in self?.qlabState = up ? .on : .off }

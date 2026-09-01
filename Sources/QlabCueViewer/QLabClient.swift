@@ -389,7 +389,9 @@ actor QLabClient {
         guard !tree.isEmpty else { return }
 
         let changed = tree != lastWorkspace
-        let stale = Date().timeIntervalSince(lastWorkspacePublish) > 15
+        // Short enough that a viewer joining mid-show fills its panel promptly,
+        // long enough that a 35 KB tree isn't a bandwidth problem.
+        let stale = Date().timeIntervalSince(lastWorkspacePublish) > 8
         guard changed || stale else { return }
 
         lastWorkspace = tree
