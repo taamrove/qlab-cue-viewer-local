@@ -20,6 +20,7 @@ final class Bridge: ObservableObject {
 
     private var qlab: QLabClient?
     private var relay: RelayPublisher?
+    private let ltc = LTCListener()
 
     init() {
         // App-level setup: NSApp policy stays default; MenuBarExtra works in
@@ -46,6 +47,12 @@ final class Bridge: ObservableObject {
         qlabState = .connecting
         relayState = .connecting
 
+        // Timecode arrives from the LTC Tap plug-in independently of the QLab
+        // poll; it just gets folded into each snapshot on its way out.
+        if settings.ltcEnabled, let ltcPort = UInt16(exactly: settings.ltcPort), ltcPort > 0 {
+            ltc.start(port: ltcPort)
+        }
+
         // Trim whitespace/newlines from pasted secrets — a `pbcopy < file` on
         // a token saved with `echo` ships an invisible trailing `\n` that the
         // server rejects, with no obvious user-facing clue why.
@@ -70,13 +77,18 @@ final class Bridge: ObservableObject {
             pollInterval: TimeInterval(settings.pollIntervalMs) / 1000,
             onSnapshot: { [weak self] snap in
                 Task { @MainActor in
+                    guard let self else { return }
+                    var merged = snap
+                    merged.timecode = self.ltc.current()
                     // Dedupe: only push to @Published (and across the wire)
                     // when the snapshot actually differs. Stops the menu from
-                    // resetting selection on every idle poll.
-                    guard self?.lastSnapshot != snap else { return }
-                    self?.lastSnapshot = snap
-                    self?.lastPublishedAt = Date()
-                    Task { await relay.publish(snap) }
+                    // resetting selection on every idle poll. A running
+                    // timecode counts as a difference, so it keeps flowing at
+                    // the poll rate; a stopped one settles and goes quiet again.
+                    guard self.lastSnapshot != merged else { return }
+                    self.lastSnapshot = merged
+                    self.lastPublishedAt = Date()
+                    Task { await relay.publish(merged) }
                 }
             },
             onState: { [weak self] up in
@@ -92,6 +104,7 @@ final class Bridge: ObservableObject {
     func stop() {
         if let relay = relay { Task { await relay.stop() } }
         if let qlab = qlab   { Task { await qlab.stop() } }
+        ltc.stop()
         qlab = nil; relay = nil
         qlabState = .off; relayState = .off
     }

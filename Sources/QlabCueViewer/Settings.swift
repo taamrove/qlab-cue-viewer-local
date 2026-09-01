@@ -13,6 +13,8 @@ enum Defaults {
     static let relayChannel = "qlab-show-1"
     static let pollIntervalMs = 250
     static let autoConnect = true
+    static let ltcEnabled = true
+    static let ltcPort = 57121
 }
 
 final class SettingsStore: ObservableObject {
@@ -26,4 +28,8 @@ final class SettingsStore: ObservableObject {
     @AppStorage("relayChannel")   var relayChannel: String  = Defaults.relayChannel
     @AppStorage("pollIntervalMs") var pollIntervalMs: Int   = Defaults.pollIntervalMs
     @AppStorage("autoConnect")    var autoConnect: Bool     = Defaults.autoConnect
+    // The LTC Tap audio plug-in reports decoded timecode here over OSC/UDP.
+    // Loopback only — see LTCListener.
+    @AppStorage("ltcEnabled")     var ltcEnabled: Bool      = Defaults.ltcEnabled
+    @AppStorage("ltcPort")        var ltcPort: Int          = Defaults.ltcPort
 }

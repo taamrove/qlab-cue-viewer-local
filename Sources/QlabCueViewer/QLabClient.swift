@@ -45,6 +45,11 @@ actor QLabClient {
         let groupPath: [String]
         let running: [CueInfo]
 
+        // Filled in by Bridge from the LTC listener, not by QLab — QLab has no
+        // idea what the timecode on the audio says. `var` so the merge can
+        // happen after the poll builds the rest of the snapshot.
+        var timecode: TimecodeInfo?
+
         // Exclude `ts` from equality so identical state across polls dedupes
         // and the menu doesn't redraw 4× per second.
         static func == (lhs: Snapshot, rhs: Snapshot) -> Bool {
@@ -53,6 +58,7 @@ actor QLabClient {
                 && lhs.playheadNumber == rhs.playheadNumber
                 && lhs.groupPath == rhs.groupPath
                 && lhs.running == rhs.running
+                && lhs.timecode == rhs.timecode
         }
     }
 
@@ -327,7 +333,8 @@ actor QLabClient {
             playheadName:   latest["/cue/playhead/displayName"] as? String,
             playheadNumber: latest["/cue/playhead/number"]      as? String,
             groupPath:      groupPath,
-            running:        running
+            running:        running,
+            timecode:       nil
         )
         onSnapshot(snap)
     }

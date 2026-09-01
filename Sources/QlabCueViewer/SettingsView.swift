@@ -80,6 +80,16 @@ struct SettingsView: View {
                 step: 50
             )
             Toggle("Auto-connect on launch", isOn: $settings.autoConnect)
+
+            Divider()
+
+            Toggle("Receive timecode from the LTC Tap plug-in", isOn: $settings.ltcEnabled)
+            TextField("Timecode port", value: $settings.ltcPort, format: .number.grouping(.never))
+                .textFieldStyle(.roundedBorder)
+                .disabled(!settings.ltcEnabled)
+            Text("The LTC Tap AudioUnit decodes the timecode on the cue output and sends it here. Listens on 127.0.0.1 only.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .padding()
     }
