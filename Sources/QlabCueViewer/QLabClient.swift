@@ -136,6 +136,10 @@ actor QLabClient {
     // channel, so a viewer that joins mid-show would otherwise never receive a
     // structure that happens not to be changing.
     private var durations: [String: Double] = [:]
+    // Group cue modes (QLab 5: 1 start-first-and-enter, 2 start-first,
+    // 3 timeline, 4 random, 6 playlist). Not in the /cueLists reply either,
+    // so fetched per group alongside durations.
+    private var groupModes: [String: Int] = [:]
     private var durationCursor = 0
     private var lastWorkspace: [WorkspaceCue] = []
     private var lastWorkspacePublish: Date = .distantPast
@@ -310,6 +314,10 @@ actor QLabClient {
                     let body = askedFor.dropFirst("/cue_id/".count).dropLast("/duration".count)
                     if !body.isEmpty, let d = numberValue(value) { durations[String(body)] = d }
                 }
+                if askedFor.hasPrefix("/cue_id/"), askedFor.hasSuffix("/mode") {
+                    let body = askedFor.dropFirst("/cue_id/".count).dropLast("/mode".count)
+                    if !body.isEmpty, let m = numberValue(value) { groupModes[String(body)] = Int(m) }
+                }
             }
         }
     }
@@ -456,6 +464,7 @@ actor QLabClient {
         // Ask for the next slice of durations, then rebuild so anything that
         // arrived since the last pass is included in what goes out.
         refreshDurations(tree)
+        refreshGroupModes(tree)
         tree = buildWorkspace(latest["/cueLists"])
 
         let changed = tree != lastWorkspace
@@ -495,7 +504,7 @@ actor QLabClient {
             colorName: (item["colorName"] as? String).flatMap { $0 == "none" || $0.isEmpty ? nil : $0 },
             armed:     item["armed"] as? Bool,
             flagged:   item["flagged"] as? Bool,
-            mode:      (item["mode"] as? Int) ?? (item["mode"] as? NSNumber)?.intValue,
+            mode:      groupModes[id] ?? (item["mode"] as? Int) ?? (item["mode"] as? NSNumber)?.intValue,
             cues:      (children?.isEmpty ?? true) ? nil : children
         )
     }
@@ -533,6 +542,27 @@ actor QLabClient {
             send(OSCMessage("/cue_id/\(id)/duration"))
         }
         durationCursor += slice
+    }
+
+    // Group modes decide whether a group's children are one piece of music on
+    // a shared clock (timeline) or separate songs (start-first / playlist), so
+    // the viewer needs them for every list, not just the current one. Groups
+    // are few compared with cues, and modes change only when the operator
+    // edits the workspace, so they're re-asked only on the slow workspace
+    // cycle (every ~5 s) rather than every tick.
+    private func refreshGroupModes(_ tree: [WorkspaceCue]) {
+        guard pollTick % workspaceEveryNTicks == 1 else { return }
+        var ids: [String] = []
+        func collect(_ cues: [WorkspaceCue]) {
+            for c in cues {
+                if c.type == "Group" { ids.append(c.id) }
+                if let kids = c.cues { collect(kids) }
+            }
+        }
+        for list in tree { collect(list.cues ?? []) }
+        let live = Set(ids)
+        groupModes = groupModes.filter { live.contains($0.key) }
+        for id in ids { send(OSCMessage("/cue_id/\(id)/mode")) }
     }
 
     // ─── /runningOrPausedCues tree walking — same as UDP version ─────────────
