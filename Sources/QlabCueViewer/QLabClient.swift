@@ -404,7 +404,7 @@ actor QLabClient {
                 number:         stub.number,
                 type:           stub.type,
                 groupPath:      stub.groupPath,
-                groupIds:       stub.groupIds,
+                groupIds:       stub.groupIds.isEmpty ? nil : stub.groupIds,  // nil → key omitted
                 preWait:        pw,
                 preWaitElapsed: numberValue(latest["/cue_id/\(stub.id)/preWaitElapsed"]),
                 duration:       dur,
