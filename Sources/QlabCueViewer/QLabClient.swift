@@ -30,6 +30,11 @@ actor QLabClient {
         let number: String?
         let type: String              // "Video", "Audio", "Memo", "Group", …
         let groupPath: [String]       // ancestor group names from outermost to immediate parent
+        // QLab uniqueIDs of the same ancestor groups, index-aligned with
+        // groupPath. Names get edited during programming; IDs don't, so the
+        // viewer anchors custom cues on these when present. Optional so the
+        // field is simply absent for anything that can't supply it.
+        let groupIds: [String]?
         let preWait: Double?
         let preWaitElapsed: Double?
         let duration: Double?
@@ -399,6 +404,7 @@ actor QLabClient {
                 number:         stub.number,
                 type:           stub.type,
                 groupPath:      stub.groupPath,
+                groupIds:       stub.groupIds,
                 preWait:        pw,
                 preWaitElapsed: numberValue(latest["/cue_id/\(stub.id)/preWaitElapsed"]),
                 duration:       dur,
@@ -535,6 +541,7 @@ actor QLabClient {
         let id, name, type: String
         let number: String?
         let groupPath: [String]
+        let groupIds: [String]
     }
 
     private func flattenRunning(_ raw: Any?) -> ([RunningStub], [String]) {
@@ -542,7 +549,7 @@ actor QLabClient {
         var occurrences: [RunningStub] = []
         var deepestPath: [String] = []
         for item in arr {
-            let walked = collect(into: &occurrences, path: [], item)
+            let walked = collect(into: &occurrences, path: [], ids: [], item)
             if walked.count > deepestPath.count { deepestPath = walked }
         }
         var bestForId: [String: RunningStub] = [:]
@@ -563,6 +570,7 @@ actor QLabClient {
     @discardableResult
     private func collect(into out: inout [RunningStub],
                          path: [String],
+                         ids: [String],
                          _ item: [String: Any]) -> [String] {
         let children = item["cues"] as? [[String: Any]] ?? []
         let displayName = (item["listName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
@@ -570,9 +578,11 @@ actor QLabClient {
 
         if !children.isEmpty {
             let newPath = displayName.map { path + [$0] } ?? path
+            // Same condition as the name, so ids stay index-aligned with path.
+            let newIds = displayName != nil ? ids + [(item["uniqueID"] as? String) ?? ""] : ids
             var deepest = newPath
             for child in children {
-                let walked = collect(into: &out, path: newPath, child)
+                let walked = collect(into: &out, path: newPath, ids: newIds, child)
                 if walked.count > deepest.count { deepest = walked }
             }
             return deepest
@@ -581,7 +591,8 @@ actor QLabClient {
         let leafName = displayName ?? "Unnamed"
         let number = (item["number"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         let type = (item["type"] as? String) ?? "Cue"
-        out.append(RunningStub(id: id, name: leafName, type: type, number: number, groupPath: path))
+        out.append(RunningStub(id: id, name: leafName, type: type, number: number,
+                               groupPath: path, groupIds: ids))
         return path
     }
 
